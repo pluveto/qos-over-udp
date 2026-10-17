@@ -1,28 +1,33 @@
-using System.Text;
 using QosDemo;
 
-var queue = new ConflationQueue();
+var filter = new SequenceWindowFilter();
 
-Console.WriteLine("--- Rapid Ingress: 5 consecutive vehicle speeds generated ---");
-// 模拟 10ms 生成一个车速，当前网络卡顿，没有网卡发送动作，全部积压在队列中
-queue.EnqueueOrUpdate("vehicle_speed", Encoding.UTF8.GetBytes("SPEED: 40 km/h"));
-queue.EnqueueOrUpdate("vehicle_speed", Encoding.UTF8.GetBytes("SPEED: 42 km/h"));
-queue.EnqueueOrUpdate("vehicle_speed", Encoding.UTF8.GetBytes("SPEED: 45 km/h"));
-queue.EnqueueOrUpdate("vehicle_speed", Encoding.UTF8.GetBytes("SPEED: 47 km/h"));
-queue.EnqueueOrUpdate("vehicle_speed", Encoding.UTF8.GetBytes("SPEED: 50 km/h"));
+// 模拟场景：
+// 发送端发射了 Reliable 指令：MessageSeq = 100（"FIRE_BULLET"）
+// 因为 ACK 丢包，发送端重传了两次：网卡共收到了 3 次 MessageSeq = 100
+// 随后发送端继续发了 101, 102，并发生了轻微乱序重传
 
-// 同时队列里还掺杂了另一个 key 的数据（比如电池电量）
-queue.EnqueueOrUpdate("battery_soc", Encoding.UTF8.GetBytes("BATTERY: 88%"));
+ushort[] incomingStream = {
+    100, // 首次到达
+    100, // 重传包到达（应该拦截）
+    100, // 再次重传到达（应该拦截）
+    102, // 乱序新包到达
+    101, // 滞后的 101 到达（应该允许交付）
+    101, // 101 重传到达（应该拦截）
+    20   // 超大跨度的陈旧历史包（应该拦截）
+};
 
-Console.WriteLine($"Queue size in memory: {queue.Count} items (instead of 6 items)\n");
-
-Console.WriteLine("--- Network Recovery: Egress Transmission ---");
-while (queue.Count > 0)
+Console.WriteLine("=== Ingress Sequence Filtering (Sliding Window Dedup) ===");
+for (int i = 0; i < incomingStream.Length; i++)
 {
-    var item = queue.Dequeue();
-    if (item != null)
+    ushort seq = incomingStream[i];
+    bool accepted = filter.TryAccept(seq);
+    if (accepted)
     {
-        string val = Encoding.UTF8.GetString(item.Value.Payload);
-        Console.WriteLine($"Egress Transmitting -> Key: '{item.Value.Key}', Value: '{val}'");
+        Console.WriteLine($"Step {i + 1}: MsgSeq {seq} -> [ACCEPTED] Deliver to business logic!");
+    }
+    else
+    {
+        Console.WriteLine($"Step {i + 1}: MsgSeq {seq} -> [DROPPED] Duplicate or obsolete packet.");
     }
 }
