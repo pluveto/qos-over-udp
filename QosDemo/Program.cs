@@ -1,51 +1,43 @@
 using System.Text;
 using QosDemo;
 
-// 模拟发送端发出了 3 个数据包：
-// 1. 遥测坐标：不可靠（丢了就算了）
-// 2. 扣费订单：强可靠（必须死磕到底）
-// 3. 战斗技能：部分可靠（TTL = 100ms，超过 100ms 就算重传到也没意义了）
+// 待发送的业务大数据（比如一张 50 字节的微缩图片）
+string largeDataString = "[IMAGE_DATA:1234567890_ABCDEFGHIJ_KLMNOPQRST_UVWXYZ]";
+byte[] largePayload = Encoding.UTF8.GetBytes(largeDataString);
 
-long now = 1000; // 当前时间戳 1000ms
+int maxFragmentSize = 20; // 假定每个 UDP 包载荷最多装 20 字节
+byte totalFragments = (byte)Math.Ceiling((double)largePayload.Length / maxFragmentSize);
 
-var p1 = new TrackedPacket(
-    packetSeq: 101, channelId: 0, messageSeq: 1,
-    payload: Encoding.UTF8.GetBytes("COORD_X_10"),
-    policy: DeliveryPolicy.Unreliable,
-    sentTimestampMs: now
-);
+Console.WriteLine($"Original Data Length: {largePayload.Length} bytes, Sliced into {totalFragments} fragments.\n");
 
-var p2 = new TrackedPacket(
-    packetSeq: 102, channelId: 1, messageSeq: 1,
-    payload: Encoding.UTF8.GetBytes("ORDER_PAY_100"),
-    policy: DeliveryPolicy.Reliable,
-    sentTimestampMs: now
-);
+ushort globalPacketSeq = 500;
+ushort channel0MsgSeq = 42; // 这张大图片对应 Channel 0 的第 42 号消息
 
-var p3 = new TrackedPacket(
-    packetSeq: 103, channelId: 2, messageSeq: 1,
-    payload: Encoding.UTF8.GetBytes("CAST_FIREBALL"),
-    policy: DeliveryPolicy.TimedReliable,
-    sentTimestampMs: now,
-    ttlMs: 100
-);
-
-List<TrackedPacket> inflightPackets = new() { p1, p2, p3 };
-
-// 模拟场景 A：时间推进了 50ms（当前时间 1050ms），收到 ACK 发现 3 个包全都没确认
-Console.WriteLine("=== Check at T = 1050ms (Elapsed 50ms) ===");
-long t1 = 1050;
-foreach (var pkt in inflightPackets)
+// 切片并模拟物理打包
+List<byte[]> slices = new();
+for (byte i = 0; i < totalFragments; i++)
 {
-    bool retransmit = pkt.ShouldRetransmit(t1);
-    Console.WriteLine($"Pkt {pkt.PacketSeq} [{pkt.Policy}]: ShouldRetransmit = {retransmit}");
+    int offset = i * maxFragmentSize;
+    int length = Math.Min(maxFragmentSize, largePayload.Length - offset);
+    ReadOnlySpan<byte> sliceSpan = largePayload.AsSpan(offset, length);
+
+    byte[] packet = FragmentedPacketHeader.Encode(
+        channelId: 0,
+        packetSeq: globalPacketSeq++,
+        messageSeq: channel0MsgSeq,
+        fragmentIndex: i,
+        fragmentTotal: totalFragments,
+        fragmentPayload: sliceSpan
+    );
+    slices.Add(packet);
 }
 
-// 模拟场景 B：时间推进了 150ms（当前时间 1150ms），网络依然卡顿
-Console.WriteLine("\n=== Check at T = 1150ms (Elapsed 150ms) ===");
-long t2 = 1150;
-foreach (var pkt in inflightPackets)
+// 接收端解析并验证每一个切片
+for (int i = 0; i < slices.Count; i++)
 {
-    bool retransmit = pkt.ShouldRetransmit(t2);
-    Console.WriteLine($"Pkt {pkt.PacketSeq} [{pkt.Policy}]: ShouldRetransmit = {retransmit}");
+    if (FragmentedPacketHeader.TryDecode(slices[i], out var header, out var payload))
+    {
+        string chunkStr = Encoding.UTF8.GetString(payload.Span);
+        Console.WriteLine($"Received Fragment: Ch={header.ChannelId}, MsgSeq={header.MessageSeq}, Frag={header.FragmentIndex + 1}/{header.FragmentTotal}, GlobalPkt={header.PacketSeq}, Content='{chunkStr}'");
+    }
 }
