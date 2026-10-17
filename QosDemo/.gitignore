@@ -1,0 +1,27 @@
+# .NET build output
+[Bb]in/
+[Oo]bj/
+artifacts/
+
+# IDE caches and user-specific settings
+.vs/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Test results and coverage output
+TestResults/
+coverage/
+*.coverage
+*.coveragexml
+
+# NuGet package output
+*.nupkg
+*.snupkg
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
