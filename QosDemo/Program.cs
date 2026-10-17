@@ -1,33 +1,60 @@
+using System.Text;
 using QosDemo;
 
-var filter = new SequenceWindowFilter();
+// 缓冲区容量 5 个，高水位线 80% (4个)，低水位线 40% (2个)
+var buffer = new BufferManager(capacity: 5, highRatio: 0.8, lowRatio: 0.4);
 
-// 模拟场景：
-// 发送端发射了 Reliable 指令：MessageSeq = 100（"FIRE_BULLET"）
-// 因为 ACK 丢包，发送端重传了两次：网卡共收到了 3 次 MessageSeq = 100
-// 随后发送端继续发了 101, 102，并发生了轻微乱序重传
-
-ushort[] incomingStream = {
-    100, // 首次到达
-    100, // 重传包到达（应该拦截）
-    100, // 再次重传到达（应该拦截）
-    102, // 乱序新包到达
-    101, // 滞后的 101 到达（应该允许交付）
-    101, // 101 重传到达（应该拦截）
-    20   // 超大跨度的陈旧历史包（应该拦截）
+buffer.OnBackpressureTriggered += () =>
+{
+    Console.WriteLine("[EVENT] High Watermark Hit! Backpressure ACTIVE. Upper layers must slow down.");
 };
 
-Console.WriteLine("=== Ingress Sequence Filtering (Sliding Window Dedup) ===");
-for (int i = 0; i < incomingStream.Length; i++)
+buffer.OnBackpressureReleased += () =>
 {
-    ushort seq = incomingStream[i];
-    bool accepted = filter.TryAccept(seq);
-    if (accepted)
+    Console.WriteLine("[EVENT] Low Watermark Hit! Backpressure RELEASED. Normal ingestion resumed.");
+};
+
+Console.WriteLine("--- Phase 1: Ingress & Watermark Rising ---");
+long t0 = 1000;
+
+// 入队 4 个包：第 4 个包触发高水位线
+buffer.TryEnqueue(0, Encoding.UTF8.GetBytes("SENSOR_1"), t0, maxQueueDurationMs: 100);
+buffer.TryEnqueue(0, Encoding.UTF8.GetBytes("SENSOR_2"), t0, maxQueueDurationMs: 100);
+buffer.TryEnqueue(0, Encoding.UTF8.GetBytes("SENSOR_3"), t0, maxQueueDurationMs: 100);
+buffer.TryEnqueue(0, Encoding.UTF8.GetBytes("SENSOR_4"), t0, maxQueueDurationMs: 100);
+
+// 入队第 5 个包，达到容量上限
+buffer.TryEnqueue(0, Encoding.UTF8.GetBytes("SENSOR_5"), t0, maxQueueDurationMs: 100);
+
+// 尝试入队第 6 个包，触发 Tail Drop
+bool enq6 = buffer.TryEnqueue(0, Encoding.UTF8.GetBytes("SENSOR_6"), t0, maxQueueDurationMs: 100);
+Console.WriteLine($"Enqueue 6th packet result (Tail Drop): {enq6}");
+
+Console.WriteLine($"\nCurrent Buffer Count: {buffer.Count}, Backpressure Active: {buffer.IsBackpressureActive}\n");
+
+Console.WriteLine("--- Phase 2: Time Passes (T = 1150ms, 150ms passed) & Egress ---");
+// 设定当前时间为 1150ms，之前入队的 SENSOR 1~5 均已在队列中滞留 150ms（超过了 100ms 最大排队时间）
+long t1 = 1150;
+
+// 出队循环：验证超时包是否被过滤，合法包是否正常出队
+while (buffer.Count > 0)
+{
+    var msg = buffer.DequeueValid(t1);
+    if (msg != null)
     {
-        Console.WriteLine($"Step {i + 1}: MsgSeq {seq} -> [ACCEPTED] Deliver to business logic!");
-    }
-    else
-    {
-        Console.WriteLine($"Step {i + 1}: MsgSeq {seq} -> [DROPPED] Duplicate or obsolete packet.");
+        string text = Encoding.UTF8.GetString(msg.Value.Payload);
+        Console.WriteLine($"[EGRESS DELIVER] Ch={msg.Value.ChannelId}: '{text}' sent to network.");
     }
 }
+
+// 此时排空旧包后，新入队一条即时紧急指令并出队
+buffer.TryEnqueue(1, Encoding.UTF8.GetBytes("LIVE_STOP"), t1, maxQueueDurationMs: 500);
+var liveMsg = buffer.DequeueValid(t1);
+if (liveMsg != null)
+{
+    string text = Encoding.UTF8.GetString(liveMsg.Value.Payload);
+    Console.WriteLine($"[EGRESS DELIVER] Ch={liveMsg.Value.ChannelId}: '{text}' sent to network.");
+}
+
+
+Console.WriteLine($"Final Buffer Count: {buffer.Count}, Backpressure Active: {buffer.IsBackpressureActive}");
