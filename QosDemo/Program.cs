@@ -1,42 +1,45 @@
 using QosDemo;
 
-Console.WriteLine("=== Verification of Value Struct without Boxing ===");
+Console.WriteLine("=== Verification of ValueRingBuffer Zero-Alloc ===");
 
-// 模拟调度队列内部持有的预分配连续值类型数组
-OutboundDescriptor[] preallocatedSlotBuffer = new OutboundDescriptor[1024];
+// 预分配容量为 1024 的定长环形队列，存放 OutboundDescriptor 值类型
+var ring = new ValueRingBuffer<OutboundDescriptor>(1024);
+
+// 预热
+var dummy = new OutboundDescriptor(0, 0, 0, 1, DeliveryPolicy.Unreliable, 0, 0);
+ring.TryEnqueue(in dummy);
+ring.TryDequeue(out _);
 
 long beforeAlloc = GC.GetAllocatedBytesForCurrentThread();
 
-// 模拟 10,000 次高频入队与属性读取
-for (int i = 0; i < 10_000; i++)
+// 模拟 100,000 次持续的高频“生产者入队 -> 消费者出队”
+for (int i = 0; i < 100_000; i++)
 {
-    int index = i % 1024;
-    
-    // 直接以值类型原地写入槽位（无 new，无堆分配，无装箱）
-    preallocatedSlotBuffer[index] = new OutboundDescriptor(
+    var desc = new OutboundDescriptor(
         channelId: 1,
-        messageSeq: (ushort)i,
+        messageSeq: (ushort)(i & 0xFFFF),
         fragmentIndex: 0,
         fragmentTotal: 1,
         policy: DeliveryPolicy.Reliable,
-        payloadLength: 120,
-        enqueueTimestampMs: 5000 + i
+        payloadLength: 256,
+        enqueueTimestampMs: 1000 + i
     );
 
-    // 以只读引用（in）读取，不产生临时副本拷贝
-    ProcessDescriptor(in preallocatedSlotBuffer[index]);
-}
-
-static void ProcessDescriptor(in OutboundDescriptor desc)
-{
-    // 直接读取字段，没有任何 object 转换
-    if (desc.Policy == DeliveryPolicy.Reliable && desc.PayloadLength > 0)
+    // 零分配入队
+    if (!ring.TryEnqueue(in desc))
     {
-        // 模拟业务调度判定
+        Console.WriteLine("Buffer full!");
+    }
+
+    // 零分配出队
+    if (!ring.TryDequeue(out var popped))
+    {
+        Console.WriteLine("Buffer empty!");
     }
 }
 
 long afterAlloc = GC.GetAllocatedBytesForCurrentThread();
 long allocated = afterAlloc - beforeAlloc;
 
-Console.WriteLine($"10,000 Ingress Operations Allocated: {allocated} bytes (Zero Heap Overhead).");
+Console.WriteLine($"100,000 Enqueue-Dequeue Cycles Allocated: {allocated} bytes.");
+Console.WriteLine($"Ring Buffer Final Count: {ring.Count}, Capacity: {ring.Capacity}");
