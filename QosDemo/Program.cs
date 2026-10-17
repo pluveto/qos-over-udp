@@ -1,25 +1,36 @@
 using System.Text;
 using QosDemo;
 
-var scheduler = new EgressPacketScheduler();
+var scheduler = new DeficitRoundRobinScheduler();
 
-// 场景：先排入了 3 个普通的大数据分片/后台日志
-scheduler.Enqueue(PriorityLevel.Normal, Encoding.UTF8.GetBytes("BULK_CHUNK_1"));
-scheduler.Enqueue(PriorityLevel.Normal, Encoding.UTF8.GetBytes("BULK_CHUNK_2"));
-scheduler.Enqueue(PriorityLevel.Normal, Encoding.UTF8.GetBytes("BULK_CHUNK_3"));
+// 设置两个平级通道，每轮分配相同的 500 字节信用额度 (Quantum = 500)
+// 通道 0：发大图切片，每个包 800 字节
+// 通道 1：发聊天文字，每个包 200 字节
+var qImage = new DrrQueue(channelId: 0, quantum: 500);
+var qChat = new DrrQueue(channelId: 1, quantum: 500);
 
-// 此时突发紧急事件：机械臂急停指令！
-Console.WriteLine("Incoming Event: Emergency STOP issued!\n");
-scheduler.Enqueue(PriorityLevel.High, Encoding.UTF8.GetBytes("EMERGENCY_STOP"));
+scheduler.AddQueue(qImage);
+scheduler.AddQueue(qChat);
 
-// 网卡循环调用 DequeueNext() 取包发送
-int sendStep = 1;
-while (scheduler.TotalPending > 0)
+// 入队待发数据：
+// 通道 0 塞入 2 个 800 字节的大包
+scheduler.Enqueue(0, new byte[800]);
+scheduler.Enqueue(0, new byte[800]);
+
+// 通道 1 塞入 4 个 200 字节的小包
+scheduler.Enqueue(1, new byte[200]);
+scheduler.Enqueue(1, new byte[200]);
+scheduler.Enqueue(1, new byte[200]);
+scheduler.Enqueue(1, new byte[200]);
+
+Console.WriteLine("=== Deficit Round Robin (DRR) Schedule Simulation ===");
+int step = 1;
+while (scheduler.HasPendingPackets)
 {
-    byte[]? pkt = scheduler.DequeueNext();
-    if (pkt != null)
+    var item = scheduler.DequeueNext();
+    if (item != null)
     {
-        string text = Encoding.UTF8.GetString(pkt);
-        Console.WriteLine($"Step {sendStep++}: Transmitting -> {text}");
+        string chName = item.Value.ChannelId == 0 ? "Image(800B)" : "Chat(200B)";
+        Console.WriteLine($"Step {step++}: Emitted packet from [{chName}]");
     }
 }
