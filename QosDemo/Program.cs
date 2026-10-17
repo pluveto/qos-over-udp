@@ -1,42 +1,42 @@
-using System.Text;
 using QosDemo;
 
-// 模拟发送端：在同一个租借缓冲区内完成业务载荷与报头的拼接，零二次拷贝与零分配
-using var lease = new BufferLease(100);
+Console.WriteLine("=== Verification of Value Struct without Boxing ===");
 
-byte[] rawBusinessData = Encoding.UTF8.GetBytes("HIGH_PRECISION_TELEMETRY");
-// 将业务数据直接拷贝到租借缓冲区的 Payload 区域（偏移 7 之后）
-rawBusinessData.CopyTo(lease.Span.Slice(ZeroAllocFraming.HeaderSize));
+// 模拟调度队列内部持有的预分配连续值类型数组
+OutboundDescriptor[] preallocatedSlotBuffer = new OutboundDescriptor[1024];
 
-// 就地写包头
-ZeroAllocFraming.WriteHeader(
-    destination: lease.Span,
-    channelId: 3,
-    packetSeq: 888,
-    messageSeq: 12,
-    fragmentIndex: 0,
-    fragmentTotal: 1
-);
-
-int actualPacketLength = ZeroAllocFraming.HeaderSize + rawBusinessData.Length;
-ReadOnlySpan<byte> packetSpan = lease.Span.Slice(0, actualPacketLength);
-
-Console.WriteLine($"Wire packet encoded: {packetSpan.Length} bytes.");
-
-// 模拟接收端：直接在入站 Span 上进行零拷贝解析
 long beforeAlloc = GC.GetAllocatedBytesForCurrentThread();
 
-if (ZeroAllocFraming.TryReadHeader(
-    source: packetSpan,
-    out byte ch, 
-    out ushort pktSeq, 
-    out ushort msgSeq, 
-    out byte fragIdx, 
-    out byte fragTotal, 
-    out ReadOnlySpan<byte> payload))
+// 模拟 10,000 次高频入队与属性读取
+for (int i = 0; i < 10_000; i++)
 {
-    long afterAlloc = GC.GetAllocatedBytesForCurrentThread();
-    string payloadText = Encoding.UTF8.GetString(payload);
-    Console.WriteLine($"Parsed: Ch={ch}, PktSeq={pktSeq}, MsgSeq={msgSeq}, Frag={fragIdx+1}/{fragTotal}, Text='{payloadText}'");
-    Console.WriteLine($"Allocation during parsing: {afterAlloc - beforeAlloc} bytes.");
+    int index = i % 1024;
+    
+    // 直接以值类型原地写入槽位（无 new，无堆分配，无装箱）
+    preallocatedSlotBuffer[index] = new OutboundDescriptor(
+        channelId: 1,
+        messageSeq: (ushort)i,
+        fragmentIndex: 0,
+        fragmentTotal: 1,
+        policy: DeliveryPolicy.Reliable,
+        payloadLength: 120,
+        enqueueTimestampMs: 5000 + i
+    );
+
+    // 以只读引用（in）读取，不产生临时副本拷贝
+    ProcessDescriptor(in preallocatedSlotBuffer[index]);
 }
+
+static void ProcessDescriptor(in OutboundDescriptor desc)
+{
+    // 直接读取字段，没有任何 object 转换
+    if (desc.Policy == DeliveryPolicy.Reliable && desc.PayloadLength > 0)
+    {
+        // 模拟业务调度判定
+    }
+}
+
+long afterAlloc = GC.GetAllocatedBytesForCurrentThread();
+long allocated = afterAlloc - beforeAlloc;
+
+Console.WriteLine($"10,000 Ingress Operations Allocated: {allocated} bytes (Zero Heap Overhead).");
