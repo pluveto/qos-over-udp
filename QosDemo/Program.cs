@@ -1,64 +1,36 @@
 using System.Text;
 using QosDemo;
 
-// 模拟发送端状态：
-ushort globalPacketSeq = 100;
-ushort channel0MsgSeq = 1;
-ushort channel1MsgSeq = 1;
+// 模拟场景：
+// 发送端连续发出 5 个包：Pkt 100, 101, 102, 103, 104
+// 其中 Pkt 101 和 103 在路上丢了！
+// 接收端实际上收到了：100, 102, 104
 
-// 1. 发送通道 0 的第一部分数据
-byte[] p1 = PacketHeader.Encode(
-    channelId: 0, 
-    packetSeq: globalPacketSeq++, 
-    messageSeq: channel0MsgSeq++, 
-    Encoding.UTF8.GetBytes("IMG_PART_1")
-);
+ushort baseSeq = 100; // 连续收到的最高号是 100
+uint sackMask = 0;
 
-// 2. 发送通道 0 的第二部分数据（假设它在网络中丢失了）
-byte[] p2 = PacketHeader.Encode(
-    channelId: 0, 
-    packetSeq: globalPacketSeq++, 
-    messageSeq: channel0MsgSeq++, 
-    Encoding.UTF8.GetBytes("IMG_PART_2")
-);
+// 102 对应的偏移是: 102 - 100 - 1 = 1 (第 1 位置 1)
+// 104 对应的偏移是: 104 - 100 - 1 = 3 (第 3 位置 1)
+sackMask |= (1u << 1);
+sackMask |= (1u << 3);
 
-// 3. 发送通道 1 的心跳指令
-byte[] p3 = PacketHeader.Encode(
-    channelId: 1, 
-    packetSeq: globalPacketSeq++, 
-    messageSeq: channel1MsgSeq++, 
-    Encoding.UTF8.GetBytes("PING")
-);
+byte[] rawAck = AckFrame.Encode(baseSeq, sackMask);
 
-Console.WriteLine("--- Network Transmission ---");
-Console.WriteLine($"Sent: Pkt {100} (Ch 0, Msg 1)");
-Console.WriteLine($"Sent: Pkt {101} (Ch 0, Msg 2) [SIMULATED DROP]");
-Console.WriteLine($"Sent: Pkt {102} (Ch 1, Msg 1)");
-
-Console.WriteLine("\n--- Receiver Processing ---");
-// 接收端维护每个通道最后处理完成的 MessageSeq（初始为 0）
-Dictionary<byte, ushort> expectedMsgSeq = new() { { 0, 1 }, { 1, 1 } };
-
-void Receive(byte[] rawPacket)
+// 发送端收到并解析这个 ACK
+if (AckFrame.TryDecode(rawAck, out var ack))
 {
-    if (!PacketHeader.TryDecode(rawPacket, out var header, out var payload))
-        return;
+    Console.WriteLine($"Received ACK: BaseSeq={ack.BasePacketSeq}, Mask={Convert.ToString(ack.SackMask, 2).PadLeft(4, '0')}");
 
-    ushort expected = expectedMsgSeq[header.ChannelId];
-    string content = Encoding.UTF8.GetString(payload.Span);
-
-    if (header.MessageSeq == expected)
+    for (ushort seq = 100; seq <= 104; seq++)
     {
-        Console.WriteLine($"[Ch {header.ChannelId}] Delivered Msg {header.MessageSeq}: '{content}' (Global Pkt {header.PacketSeq})");
-        expectedMsgSeq[header.ChannelId]++;
-    }
-    else if (header.MessageSeq > expected)
-    {
-        Console.WriteLine($"[Ch {header.ChannelId}] Blocked! Got Msg {header.MessageSeq}, but waiting for Msg {expected} (Global Pkt {header.PacketSeq})");
+        bool ok = ack.IsAcknowledged(seq);
+        if (ok)
+        {
+            Console.WriteLine($"  Packet {seq}: Confirmed received.");
+        }
+        else
+        {
+            Console.WriteLine($"  Packet {seq}: MISSING -> Need Retransmit!");
+        }
     }
 }
-
-// 模拟到达顺序：p1 到达，p2 丢失，p3 到达
-Receive(p1);
-// p2 被路由器丢弃，未调用 Receive(p2)
-Receive(p3);
