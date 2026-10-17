@@ -1,36 +1,51 @@
 using System.Text;
 using QosDemo;
 
-// 模拟场景：
-// 发送端连续发出 5 个包：Pkt 100, 101, 102, 103, 104
-// 其中 Pkt 101 和 103 在路上丢了！
-// 接收端实际上收到了：100, 102, 104
+// 模拟发送端发出了 3 个数据包：
+// 1. 遥测坐标：不可靠（丢了就算了）
+// 2. 扣费订单：强可靠（必须死磕到底）
+// 3. 战斗技能：部分可靠（TTL = 100ms，超过 100ms 就算重传到也没意义了）
 
-ushort baseSeq = 100; // 连续收到的最高号是 100
-uint sackMask = 0;
+long now = 1000; // 当前时间戳 1000ms
 
-// 102 对应的偏移是: 102 - 100 - 1 = 1 (第 1 位置 1)
-// 104 对应的偏移是: 104 - 100 - 1 = 3 (第 3 位置 1)
-sackMask |= (1u << 1);
-sackMask |= (1u << 3);
+var p1 = new TrackedPacket(
+    packetSeq: 101, channelId: 0, messageSeq: 1,
+    payload: Encoding.UTF8.GetBytes("COORD_X_10"),
+    policy: DeliveryPolicy.Unreliable,
+    sentTimestampMs: now
+);
 
-byte[] rawAck = AckFrame.Encode(baseSeq, sackMask);
+var p2 = new TrackedPacket(
+    packetSeq: 102, channelId: 1, messageSeq: 1,
+    payload: Encoding.UTF8.GetBytes("ORDER_PAY_100"),
+    policy: DeliveryPolicy.Reliable,
+    sentTimestampMs: now
+);
 
-// 发送端收到并解析这个 ACK
-if (AckFrame.TryDecode(rawAck, out var ack))
+var p3 = new TrackedPacket(
+    packetSeq: 103, channelId: 2, messageSeq: 1,
+    payload: Encoding.UTF8.GetBytes("CAST_FIREBALL"),
+    policy: DeliveryPolicy.TimedReliable,
+    sentTimestampMs: now,
+    ttlMs: 100
+);
+
+List<TrackedPacket> inflightPackets = new() { p1, p2, p3 };
+
+// 模拟场景 A：时间推进了 50ms（当前时间 1050ms），收到 ACK 发现 3 个包全都没确认
+Console.WriteLine("=== Check at T = 1050ms (Elapsed 50ms) ===");
+long t1 = 1050;
+foreach (var pkt in inflightPackets)
 {
-    Console.WriteLine($"Received ACK: BaseSeq={ack.BasePacketSeq}, Mask={Convert.ToString(ack.SackMask, 2).PadLeft(4, '0')}");
+    bool retransmit = pkt.ShouldRetransmit(t1);
+    Console.WriteLine($"Pkt {pkt.PacketSeq} [{pkt.Policy}]: ShouldRetransmit = {retransmit}");
+}
 
-    for (ushort seq = 100; seq <= 104; seq++)
-    {
-        bool ok = ack.IsAcknowledged(seq);
-        if (ok)
-        {
-            Console.WriteLine($"  Packet {seq}: Confirmed received.");
-        }
-        else
-        {
-            Console.WriteLine($"  Packet {seq}: MISSING -> Need Retransmit!");
-        }
-    }
+// 模拟场景 B：时间推进了 150ms（当前时间 1150ms），网络依然卡顿
+Console.WriteLine("\n=== Check at T = 1150ms (Elapsed 150ms) ===");
+long t2 = 1150;
+foreach (var pkt in inflightPackets)
+{
+    bool retransmit = pkt.ShouldRetransmit(t2);
+    Console.WriteLine($"Pkt {pkt.PacketSeq} [{pkt.Policy}]: ShouldRetransmit = {retransmit}");
 }
