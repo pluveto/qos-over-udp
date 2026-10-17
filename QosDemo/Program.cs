@@ -1,39 +1,64 @@
+using System.Text;
 using QosDemo;
 
-Console.WriteLine("=== Verification of Zero-Alloc DRR Scheduler ===");
+Console.WriteLine("=== Verification of Real Socket Zero-Alloc Pipeline ===");
 
-// 构造两个平级通道：每轮分配 500 字节信用额度 (Quantum = 500)
-var chImage = new ZeroAllocDrrChannel(channelId: 0, quantum: 500, ringCapacity: 1024);
-var chChat = new ZeroAllocDrrChannel(channelId: 1, quantum: 500, ringCapacity: 1024);
+int portA = 19001;
+int portB = 19002;
 
-var scheduler = new ZeroAllocDrrScheduler(new[] { chImage, chChat });
+using var nodeA = new UdpTransportEngine(localPort: portA, remotePort: portB);
+using var nodeB = new UdpTransportEngine(localPort: portB, remotePort: portA);
 
-// 预热
-var dummy = new OutboundDescriptor(0, 0, 0, 1, DeliveryPolicy.Unreliable, 100, 0);
-scheduler.TryEnqueue(0, in dummy);
-scheduler.TryDequeueNext(out _);
+// 预先准备好要发送的静态测试载荷，避免测试代码本身的 string/byte[] 干扰引擎指标
+byte[] staticPayload = Encoding.UTF8.GetBytes("STATIC_PAYLOAD_TEST");
+
+// 预热：让操作系统和运行时网络栈完成初始化
+using (var warmupLease = new BufferLease(64))
+{
+    nodeA.Send(warmupLease.Span);
+    nodeB.Receive();
+}
 
 long beforeAlloc = GC.GetAllocatedBytesForCurrentThread();
 
-// 模拟 10,000 次调度运转：
-// 通道 0 灌入大包（载荷 793B + 7B头 = 800B）
-// 通道 1 灌入小包（载荷 193B + 7B头 = 200B）
-for (int i = 0; i < 5000; i++)
+// 连续进行 1,000 次通过真实操作系统内核网络栈的 UDP 发射与接收
+for (int i = 0; i < 1000; i++)
 {
-    var bigDesc = new OutboundDescriptor(0, (ushort)i, 0, 1, DeliveryPolicy.Reliable, 793, 1000);
-    var smallDesc = new OutboundDescriptor(1, (ushort)i, 0, 1, DeliveryPolicy.Unreliable, 193, 1000);
-
-    scheduler.TryEnqueue(0, in bigDesc);
-    scheduler.TryEnqueue(1, in smallDesc);
-
-    // 调度出队
-    while (scheduler.TryDequeueNext(out var popped))
+    // 1. 发送端：池化租借并物理发射
+    using (var lease = new BufferLease(64))
     {
-        // 模拟向网卡投递（零分配消费）
+        staticPayload.CopyTo(lease.Span.Slice(ZeroAllocFraming.HeaderSize));
+
+        ZeroAllocFraming.WriteHeader(
+            destination: lease.Span,
+            channelId: 2,
+            packetSeq: (ushort)i,
+            messageSeq: (ushort)i,
+            fragmentIndex: 0,
+            fragmentTotal: 1
+        );
+
+        int wireLength = ZeroAllocFraming.HeaderSize + staticPayload.Length;
+        nodeA.Send(lease.Span.Slice(0, wireLength));
     }
+
+    // 2. 接收端：网络抓包并切片解析
+    int bytesReceived = nodeB.Receive();
+    ReadOnlySpan<byte> receivedSpan = nodeB.GetReceivedSpan(bytesReceived);
+
+    ZeroAllocFraming.TryReadHeader(
+        receivedSpan,
+        out byte ch,
+        out ushort pktSeq,
+        out ushort msgSeq,
+        out byte fragIdx,
+        out byte fragTotal,
+        out ReadOnlySpan<byte> payload
+    );
 }
 
 long afterAlloc = GC.GetAllocatedBytesForCurrentThread();
 long allocated = afterAlloc - beforeAlloc;
 
-Console.WriteLine($"10,000 High-Throughput DRR Operations Allocated: {allocated} bytes.");
+Console.WriteLine($"Transmitted 1,000 real UDP datagrams across real OS socket.");
+Console.WriteLine($"Steady-state allocation for 1,000 socket round-trips: {allocated} bytes.");
