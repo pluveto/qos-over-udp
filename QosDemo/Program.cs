@@ -1,43 +1,54 @@
 using System.Text;
 using QosDemo;
 
-// 待发送的业务大数据（比如一张 50 字节的微缩图片）
-string largeDataString = "[IMAGE_DATA:1234567890_ABCDEFGHIJ_KLMNOPQRST_UVWXYZ]";
-byte[] largePayload = Encoding.UTF8.GetBytes(largeDataString);
+var reassembler = new MessageReassembler();
 
-int maxFragmentSize = 20; // 假定每个 UDP 包载荷最多装 20 字节
-byte totalFragments = (byte)Math.Ceiling((double)largePayload.Length / maxFragmentSize);
+// 模拟发送交错到达的三个物理包：
+// 1. 大图片的第一块 (Ch 0, Msg 42, Frag 0/2)
+// 2. 紧急心跳指令 (Ch 1, Msg 1, Frag 0/1) —— 强行插入中间！
+// 3. 大图片的第二块 (Ch 0, Msg 42, Frag 1/2)
 
-Console.WriteLine($"Original Data Length: {largePayload.Length} bytes, Sliced into {totalFragments} fragments.\n");
+byte[] pkt1 = FragmentedPacketHeader.Encode(
+    channelId: 0, packetSeq: 100, messageSeq: 42,
+    fragmentIndex: 0, fragmentTotal: 2,
+    Encoding.UTF8.GetBytes("[IMAGE_LEFT]")
+);
 
-ushort globalPacketSeq = 500;
-ushort channel0MsgSeq = 42; // 这张大图片对应 Channel 0 的第 42 号消息
+byte[] pkt2 = FragmentedPacketHeader.Encode(
+    channelId: 1, packetSeq: 101, messageSeq: 1,
+    fragmentIndex: 0, fragmentTotal: 1,
+    Encoding.UTF8.GetBytes("URGENT_PING")
+);
 
-// 切片并模拟物理打包
-List<byte[]> slices = new();
-for (byte i = 0; i < totalFragments; i++)
+byte[] pkt3 = FragmentedPacketHeader.Encode(
+    channelId: 0, packetSeq: 102, messageSeq: 42,
+    fragmentIndex: 1, fragmentTotal: 2,
+    Encoding.UTF8.GetBytes("[IMAGE_RIGHT]")
+);
+
+// 接收端统一接收循环
+void ProcessIncoming(byte[] rawPacket)
 {
-    int offset = i * maxFragmentSize;
-    int length = Math.Min(maxFragmentSize, largePayload.Length - offset);
-    ReadOnlySpan<byte> sliceSpan = largePayload.AsSpan(offset, length);
+    if (!FragmentedPacketHeader.TryDecode(rawPacket, out var header, out var payload))
+        return;
 
-    byte[] packet = FragmentedPacketHeader.Encode(
-        channelId: 0,
-        packetSeq: globalPacketSeq++,
-        messageSeq: channel0MsgSeq,
-        fragmentIndex: i,
-        fragmentTotal: totalFragments,
-        fragmentPayload: sliceSpan
-    );
-    slices.Add(packet);
-}
-
-// 接收端解析并验证每一个切片
-for (int i = 0; i < slices.Count; i++)
-{
-    if (FragmentedPacketHeader.TryDecode(slices[i], out var header, out var payload))
+    byte[]? fullMessage = reassembler.AddFragment(header, payload.Span);
+    if (fullMessage != null)
     {
-        string chunkStr = Encoding.UTF8.GetString(payload.Span);
-        Console.WriteLine($"Received Fragment: Ch={header.ChannelId}, MsgSeq={header.MessageSeq}, Frag={header.FragmentIndex + 1}/{header.FragmentTotal}, GlobalPkt={header.PacketSeq}, Content='{chunkStr}'");
+        string text = Encoding.UTF8.GetString(fullMessage);
+        Console.WriteLine($"[DELIVERED] Ch={header.ChannelId}, MsgSeq={header.MessageSeq}: \"{text}\"");
+    }
+    else
+    {
+        Console.WriteLine($"[BUFFERING] Ch={header.ChannelId}, MsgSeq={header.MessageSeq}: Waiting for remaining fragments...");
     }
 }
+
+Console.WriteLine("Step 1: Receive Pkt 100 (Image Part 1)");
+ProcessIncoming(pkt1);
+
+Console.WriteLine("\nStep 2: Receive Pkt 101 (Interleaved Urgent Ping)");
+ProcessIncoming(pkt2);
+
+Console.WriteLine("\nStep 3: Receive Pkt 102 (Image Part 2)");
+ProcessIncoming(pkt3);
