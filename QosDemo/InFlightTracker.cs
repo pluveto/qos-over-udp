@@ -90,6 +90,8 @@ public sealed class InFlightTracker
         int index = packetSeq & _mask;
         ref var slot = ref _slots[index];
 
+        slotCopy = slot;
+
         if (slot.State == TrackedSlotState.InFlight && slot.PacketSeq == packetSeq)
         {
             long elapsed = nowMs - slot.SentTimestampMs;
@@ -101,11 +103,10 @@ public sealed class InFlightTracker
                 _ => false
             };
 
-            slotCopy = slot;
             return shouldRetransmit;
         }
 
-        slotCopy = default;
         return false;
     }
+
 }

@@ -1,65 +1,26 @@
-using System.Text;
 using QosDemo;
 
-Console.WriteLine("=== Verification of InboundDeliveryGate Pipeline ===");
+Console.WriteLine("=== Verification of ACK Feedback Integration ===");
 
-var sackGen = new SackGenerator();
-var gate = new InboundDeliveryGate(sackGen);
+var tracker = new InFlightTracker(capacity: 64);
 
-int deliveredCount = 0;
-gate.OnMessageReceived += (channelId, msgSeq, payload) =>
-{
-    deliveredCount++;
-    if (deliveredCount <= 2)
-    {
-        string text = Encoding.UTF8.GetString(payload);
-        Console.WriteLine($"[APP DELIVERED] Ch={channelId}, MsgSeq={msgSeq}, Content='{text}'");
-    }
-};
+// 发送端发出两个物理包：500 和 502（假设 501 丢了）
+tracker.TrackPacket(500, 0, 1, 0, 1, DeliveryPolicy.Reliable, 0, 100, 1000, 0);
+tracker.TrackPacket(501, 0, 2, 0, 1, DeliveryPolicy.Reliable, 0, 100, 1000, 0);
+tracker.TrackPacket(502, 0, 3, 0, 1, DeliveryPolicy.Reliable, 0, 100, 1000, 0);
 
+// 接收端生成 SACK：Base=500，第 1 位是 1（502 到达，偏移 1）
+ushort baseSeq = 500;
+uint sackMask = 0b0010; // 502 - 500 - 1 = 1
 
-// 构造测试数据包
-// 场景 A：单包消息（Msg 10），因为网络重传连续来了 3 次（物理 Pkt 100, 101, 102）
-using var lease = new BufferLease(64);
-byte[] fireCmd = Encoding.UTF8.GetBytes("FIRE_CANNON");
-fireCmd.CopyTo(lease.Span.Slice(ZeroAllocFraming.HeaderSize));
+// 处理该 ACK
+AckProcessor.ProcessAck(tracker, baseSeq, sackMask);
 
-for (ushort pkt = 100; pkt <= 102; pkt++)
-{
-    ZeroAllocFraming.WriteHeader(
-        destination: lease.Span,
-        channelId: 1,
-        packetSeq: pkt,
-        messageSeq: 10,
-        fragmentIndex: 0,
-        fragmentTotal: 1
-    );
+// 检查三个包的当前状态
+tracker.CheckRetransmit(500, 1500, out var slot500);
+tracker.CheckRetransmit(501, 1500, out var slot501);
+tracker.CheckRetransmit(502, 1500, out var slot502);
 
-    int wireLen = ZeroAllocFraming.HeaderSize + fireCmd.Length;
-    gate.ProcessInboundPacket(lease.Span.Slice(0, wireLen));
-}
-
-Console.WriteLine($"Fire Cannon Delivered Times: {deliveredCount} (Expected: 1)");
-Console.WriteLine($"SACK Generator BasePacketSeq: {sackGen.BasePacketSeq} (Expected: 102)");
-
-// 预热：消除 JIT 首次编译和委托初始化的开销
-ZeroAllocFraming.WriteHeader(lease.Span, 2, 0, 0, 0, 1);
-gate.ProcessInboundPacket(lease.Span.Slice(0, ZeroAllocFraming.HeaderSize + fireCmd.Length));
-
-// 性能分配验证：连续处理 10,000 次到达（静默执行，不打印以防刷屏）
-long beforeAlloc = GC.GetAllocatedBytesForCurrentThread();
-
-for (int i = 0; i < 10_000; i++)
-{
-    ushort seq = (ushort)(i + 200);
-    ZeroAllocFraming.WriteHeader(lease.Span, 2, seq, seq, 0, 1);
-    gate.ProcessInboundPacket(lease.Span.Slice(0, ZeroAllocFraming.HeaderSize + fireCmd.Length));
-}
-
-long afterAlloc = GC.GetAllocatedBytesForCurrentThread();
-long allocated = afterAlloc - beforeAlloc;
-
-
-Console.WriteLine($"\nProcessed 10,000 inbound wire packets into delivery gate.");
-Console.WriteLine($"Steady-state heap allocation: {allocated} bytes (Zero Allocation).");
-
+Console.WriteLine($"Pkt 500 State: {slot500.State} (Expected: Acknowledged)");
+Console.WriteLine($"Pkt 501 State: {slot501.State} (Expected: InFlight -> Needs Retransmit!)");
+Console.WriteLine($"Pkt 502 State: {slot502.State} (Expected: Acknowledged)");
