@@ -1,40 +1,65 @@
+using System.Text;
 using QosDemo;
 
-Console.WriteLine("=== Verification of Zero-Alloc SackGenerator ===");
+Console.WriteLine("=== Verification of InboundDeliveryGate Pipeline ===");
 
-var generator = new SackGenerator();
+var sackGen = new SackGenerator();
+var gate = new InboundDeliveryGate(sackGen);
 
-// 模拟场景：
-// 发送端发出：100, 101, 102, 103, 104
-// 到达序列：100 到达，101 丢包，102 到达，103 到达
-generator.RecordReceived(100);
-Console.WriteLine($"After Pkt 100: BaseSeq={generator.BasePacketSeq}, SackMask={Convert.ToString(generator.SackMask, 2)}");
+int deliveredCount = 0;
+gate.OnMessageReceived += (channelId, msgSeq, payload) =>
+{
+    deliveredCount++;
+    if (deliveredCount <= 2)
+    {
+        string text = Encoding.UTF8.GetString(payload);
+        Console.WriteLine($"[APP DELIVERED] Ch={channelId}, MsgSeq={msgSeq}, Content='{text}'");
+    }
+};
 
-generator.RecordReceived(102); // 101 丢了，102 提前到达
-Console.WriteLine($"After Pkt 102: BaseSeq={generator.BasePacketSeq}, SackMask={Convert.ToString(generator.SackMask, 2)}");
 
-generator.RecordReceived(103); // 103 提前到达
-Console.WriteLine($"After Pkt 103: BaseSeq={generator.BasePacketSeq}, SackMask={Convert.ToString(generator.SackMask, 2)}");
+// 构造测试数据包
+// 场景 A：单包消息（Msg 10），因为网络重传连续来了 3 次（物理 Pkt 100, 101, 102）
+using var lease = new BufferLease(64);
+byte[] fireCmd = Encoding.UTF8.GetBytes("FIRE_CANNON");
+fireCmd.CopyTo(lease.Span.Slice(ZeroAllocFraming.HeaderSize));
 
-// 此时 101 重传终于送达！
-Console.WriteLine("\n--- Fast Retransmit: Pkt 101 finally arrives ---");
-generator.RecordReceived(101);
-Console.WriteLine($"After Pkt 101: BaseSeq={generator.BasePacketSeq}, SackMask={Convert.ToString(generator.SackMask, 2)}");
+for (ushort pkt = 100; pkt <= 102; pkt++)
+{
+    ZeroAllocFraming.WriteHeader(
+        destination: lease.Span,
+        channelId: 1,
+        packetSeq: pkt,
+        messageSeq: 10,
+        fragmentIndex: 0,
+        fragmentTotal: 1
+    );
 
-// 性能分配验证：连续 10,000 次操作
-var perfGen = new SackGenerator();
-perfGen.RecordReceived(0); // 预热
+    int wireLen = ZeroAllocFraming.HeaderSize + fireCmd.Length;
+    gate.ProcessInboundPacket(lease.Span.Slice(0, wireLen));
+}
 
+Console.WriteLine($"Fire Cannon Delivered Times: {deliveredCount} (Expected: 1)");
+Console.WriteLine($"SACK Generator BasePacketSeq: {sackGen.BasePacketSeq} (Expected: 102)");
+
+// 预热：消除 JIT 首次编译和委托初始化的开销
+ZeroAllocFraming.WriteHeader(lease.Span, 2, 0, 0, 0, 1);
+gate.ProcessInboundPacket(lease.Span.Slice(0, ZeroAllocFraming.HeaderSize + fireCmd.Length));
+
+// 性能分配验证：连续处理 10,000 次到达（静默执行，不打印以防刷屏）
 long beforeAlloc = GC.GetAllocatedBytesForCurrentThread();
 
-for (int i = 1; i <= 10_000; i++)
+for (int i = 0; i < 10_000; i++)
 {
-    perfGen.RecordReceived((ushort)i);
+    ushort seq = (ushort)(i + 200);
+    ZeroAllocFraming.WriteHeader(lease.Span, 2, seq, seq, 0, 1);
+    gate.ProcessInboundPacket(lease.Span.Slice(0, ZeroAllocFraming.HeaderSize + fireCmd.Length));
 }
 
 long afterAlloc = GC.GetAllocatedBytesForCurrentThread();
 long allocated = afterAlloc - beforeAlloc;
 
 
-Console.WriteLine($"\nProcessed 10,000 packets into SackGenerator.");
+Console.WriteLine($"\nProcessed 10,000 inbound wire packets into delivery gate.");
 Console.WriteLine($"Steady-state heap allocation: {allocated} bytes (Zero Allocation).");
+
