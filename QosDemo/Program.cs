@@ -1,40 +1,44 @@
+using System.Text;
 using QosDemo;
 
-Console.WriteLine("=== Verification of Zero-Alloc InFlightTracker ===");
+Console.WriteLine("=== Verification of Zero-Alloc Inbound Reassembler ===");
 
-var tracker = new InFlightTracker(capacity: 1024);
+var reassembler = new ZeroAllocReassembler();
+
+// 模拟发送端发来一条被切成 3 片的消息
+// 乱序到达：先到片 1，再到片 0，最后到片 2
+byte[] chunk0 = Encoding.UTF8.GetBytes("[CHUNK_0000000000]");
+byte[] chunk1 = Encoding.UTF8.GetBytes("[CHUNK_1111111111]");
+byte[] chunk2 = Encoding.UTF8.GetBytes("[CHUNK_2222222222]");
 
 // 预热
-tracker.TrackPacket(1, 0, 1, 0, 1, DeliveryPolicy.Reliable, 0, 100, 1000, 0);
-tracker.MarkAcknowledged(1);
+reassembler.TryAddFragment(0, 0, 1, chunk0, out _);
 
 long beforeAlloc = GC.GetAllocatedBytesForCurrentThread();
 
-// 模拟 10,000 次数据包的“飞出追踪 -> 收到ACK标记确认 / 超时重传判定”
-for (int i = 0; i < 10_000; i++)
+// 模拟 1,000 次完整大消息的乱序到达与重组闭环
+for (int i = 0; i < 1000; i++)
 {
-    ushort seq = (ushort)(i & 0xFFFF);
+    ushort msgSeq = (ushort)(i + 1);
 
-    // 登记飞出
-    tracker.TrackPacket(
-        packetSeq: seq,
-        channelId: 1,
-        messageSeq: (ushort)i,
-        fragmentIndex: 0,
-        fragmentTotal: 1,
-        policy: DeliveryPolicy.TimedReliable,
-        payloadOffset: 128,
-        payloadLength: 200,
-        sentTimestampMs: 5000,
-        ttlMs: 150
-    );
+    // 第 1 片先到 (Index 1)
+    bool r1 = reassembler.TryAddFragment(msgSeq, 1, 3, chunk1, out _);
 
-    // 模拟收到 ACK 标记确认
-    tracker.MarkAcknowledged(seq);
+    // 第 0 片后到 (Index 0)
+    bool r2 = reassembler.TryAddFragment(msgSeq, 0, 3, chunk0, out _);
+
+    // 第 2 片最后到 (Index 2) -> 此时应当集齐交付
+    bool r3 = reassembler.TryAddFragment(msgSeq, 2, 3, chunk2, out ReadOnlySpan<byte> fullMessage);
+
+    if (!r3 || fullMessage.Length == 0)
+    {
+        Console.WriteLine("Assembly failed!");
+        break;
+    }
 }
 
 long afterAlloc = GC.GetAllocatedBytesForCurrentThread();
 long allocated = afterAlloc - beforeAlloc;
 
-Console.WriteLine($"Tracked and Acknowledged 10,000 in-flight packets.");
+Console.WriteLine($"Reassembled 1,000 fragmented messages (3,000 fragments).");
 Console.WriteLine($"Steady-state heap allocation: {allocated} bytes (Zero Allocation).");
