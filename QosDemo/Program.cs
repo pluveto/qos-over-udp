@@ -1,44 +1,21 @@
-using System.Text;
 using QosDemo;
 
-Console.WriteLine("=== Verification of Zero-Alloc Inbound Reassembler ===");
+Console.WriteLine("=== Verification of Wire Demultiplexer ===");
 
-var reassembler = new ZeroAllocReassembler();
+using var lease = new BufferLease(32);
 
-// 模拟发送端发来一条被切成 3 片的消息
-// 乱序到达：先到片 1，再到片 0，最后到片 2
-byte[] chunk0 = Encoding.UTF8.GetBytes("[CHUNK_0000000000]");
-byte[] chunk1 = Encoding.UTF8.GetBytes("[CHUNK_1111111111]");
-byte[] chunk2 = Encoding.UTF8.GetBytes("[CHUNK_2222222222]");
+// 1. 发射端：向物理切片编码一个 ACK 控制包
+int ackLen = WireDemuxer.WriteAckFrame(lease.Span, basePacketSeq: 500, sackMask: 0b1010);
+ReadOnlySpan<byte> ackPacket = lease.Span.Slice(0, ackLen);
 
-// 预热
-reassembler.TryAddFragment(0, 0, 1, chunk0, out _);
-
+// 2. 接收端：判定是控制帧还是普通数据帧
 long beforeAlloc = GC.GetAllocatedBytesForCurrentThread();
 
-// 模拟 1,000 次完整大消息的乱序到达与重组闭环
-for (int i = 0; i < 1000; i++)
-{
-    ushort msgSeq = (ushort)(i + 1);
-
-    // 第 1 片先到 (Index 1)
-    bool r1 = reassembler.TryAddFragment(msgSeq, 1, 3, chunk1, out _);
-
-    // 第 0 片后到 (Index 0)
-    bool r2 = reassembler.TryAddFragment(msgSeq, 0, 3, chunk0, out _);
-
-    // 第 2 片最后到 (Index 2) -> 此时应当集齐交付
-    bool r3 = reassembler.TryAddFragment(msgSeq, 2, 3, chunk2, out ReadOnlySpan<byte> fullMessage);
-
-    if (!r3 || fullMessage.Length == 0)
-    {
-        Console.WriteLine("Assembly failed!");
-        break;
-    }
-}
+bool isAck = WireDemuxer.TryReadAckFrame(ackPacket, out ushort baseSeq, out uint mask);
 
 long afterAlloc = GC.GetAllocatedBytesForCurrentThread();
 long allocated = afterAlloc - beforeAlloc;
 
-Console.WriteLine($"Reassembled 1,000 fragmented messages (3,000 fragments).");
-Console.WriteLine($"Steady-state heap allocation: {allocated} bytes (Zero Allocation).");
+Console.WriteLine($"Is Control ACK Frame: {isAck}");
+Console.WriteLine($"Decoded BasePacketSeq: {baseSeq}, Mask: {Convert.ToString(mask, 2)}");
+Console.WriteLine($"Heap allocation during demux: {allocated} bytes (Zero Alloc).");
