@@ -94,6 +94,7 @@ public sealed class ZeroAllocDrrScheduler
         return false;
     }
 
+
     private void Advance()
     {
         _currentIndex = (_currentIndex + 1) % _channels.Length;
